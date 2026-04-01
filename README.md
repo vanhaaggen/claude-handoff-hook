@@ -87,7 +87,7 @@ rm -rf ~/.claude/handoff-hook-state
 
 ## How the token count is calculated
 
-The hook reads token usage directly from Claude Code's JSONL transcript — no API calls, no extra dependencies. It mirrors the same formula used by Claude Code internally (`tokens.ts:getTokenCountFromUsage`):
+The hook reads token usage directly from Claude Code's JSONL transcript — no API calls, no extra dependencies, the formula it uses is:
 
 ```
 input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens
