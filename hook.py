@@ -41,9 +41,6 @@ def count_tokens_from_transcript(transcript_path: str) -> int:
     """
     Reads the JSONL transcript and returns the total context window tokens
     from the last real assistant message.
-
-    Formula (mirrors tokens.ts:getTokenCountFromUsage):
-      input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens
     """
     last_usage = None
 
