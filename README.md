@@ -4,10 +4,11 @@ A [Claude Code](https://claude.ai/code) Stop hook that automatically asks Claude
 
 ## How it works
 
-The hook fires after every assistant turn. Once context usage crosses a configurable threshold (default: 60%), it injects a system message instructing Claude to:
+The hook fires after every assistant turn. Once context usage crosses a configurable threshold (default: 60%), it:
 
-1. Write a `handoff-<YYYYMMDD-HHMM>.md` file in the current working directory summarizing goal, progress, decisions, next steps, and critical context.
-2. Suggest starting a fresh session with: *"Read handoff-\<filename\>.md and continue from there."*
+1. Writes a `handoff-<YYYYMMDD-HHMM>.md` file in the current working directory — directly, without relying on Claude. The file contains the full conversation transcript (user messages, assistant responses, and tool calls).
+2. Injects a system message instructing Claude to fill in a structured Summary section (goal, progress, decisions, next steps, critical context) in the already-created file.
+3. Asks Claude to suggest starting a fresh session with: *"Read handoff-\<filename\>.md and continue from there."*
 
 The hook fires **once per session** — it won't spam you on every subsequent turn.
 

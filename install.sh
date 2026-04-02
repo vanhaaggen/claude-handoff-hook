@@ -7,6 +7,10 @@ set -euo pipefail
 HOOK_SCRIPT="$(cd "$(dirname "$0")" && pwd)/hook.py"
 SETTINGS="$HOME/.claude/settings.json"
 
+# Resolve python3 — pyenv shims don't work in Claude Code's hook subprocess
+# because it runs without shell profile initialization.
+PYTHON3="$(pyenv which python3 2>/dev/null || which python3)"
+
 # Make hook.py executable
 chmod +x "$HOOK_SCRIPT"
 
@@ -25,11 +29,12 @@ if grep -q "claude-handoff-hook" "$SETTINGS" 2>/dev/null; then
 fi
 
 # Use Python to safely merge the hook into existing JSON
-python3 - "$SETTINGS" "$HOOK_SCRIPT" <<'PYEOF'
+python3 - "$SETTINGS" "$HOOK_SCRIPT" "$PYTHON3" <<'PYEOF'
 import json, sys
 
 settings_path = sys.argv[1]
 hook_path = sys.argv[2]
+python_path = sys.argv[3]
 
 with open(settings_path, "r") as f:
     settings = json.load(f)
@@ -39,7 +44,7 @@ new_hook = {
     "hooks": [
         {
             "type": "command",
-            "command": f"python3 {hook_path}"
+            "command": f"{python_path} {hook_path}"
         }
     ]
 }
