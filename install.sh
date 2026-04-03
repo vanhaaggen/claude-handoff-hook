@@ -11,6 +11,12 @@ SETTINGS="$HOME/.claude/settings.json"
 # because it runs without shell profile initialization.
 PYTHON3="$(pyenv which python3 2>/dev/null || which python3)"
 
+# Validate the resolved binary
+if ! "$PYTHON3" --version &>/dev/null; then
+  echo "Error: Could not find a working python3 (tried: $PYTHON3)" >&2
+  exit 1
+fi
+
 # Make hook.py executable
 chmod +x "$HOOK_SCRIPT"
 
@@ -22,14 +28,14 @@ if [ ! -f "$SETTINGS" ]; then
   echo "{}" > "$SETTINGS"
 fi
 
-# Check if already installed
-if grep -q "claude-handoff-hook" "$SETTINGS" 2>/dev/null; then
+# Check if already installed (look for the unique marker comment in the JSON)
+if grep -q '"_handoff_hook"' "$SETTINGS" 2>/dev/null; then
   echo "✓ Handoff hook already installed in $SETTINGS"
   exit 0
 fi
 
 # Use Python to safely merge the hook into existing JSON
-python3 - "$SETTINGS" "$HOOK_SCRIPT" "$PYTHON3" <<'PYEOF'
+"$PYTHON3" - "$SETTINGS" "$HOOK_SCRIPT" "$PYTHON3" <<'PYEOF'
 import json, sys
 
 settings_path = sys.argv[1]
@@ -40,11 +46,12 @@ with open(settings_path, "r") as f:
     settings = json.load(f)
 
 new_hook = {
+    "_handoff_hook": "https://github.com/vanhaaggen/claude-handoff-hook",
     "matcher": "",
     "hooks": [
         {
             "type": "command",
-            "command": f"{python_path} {hook_path}"
+            "command": f'"{python_path}" "{hook_path}"'
         }
     ]
 }
@@ -61,8 +68,8 @@ print(f"✓ Hook added to {settings_path}")
 PYEOF
 
 echo ""
-echo "Done. The handoff hook will fire when context reaches 60%."
+echo "Done. The handoff hook will fire when context reaches 75%."
 echo ""
 echo "To adjust the threshold, set env vars in the hook entry or edit hook.py:"
-echo "  HANDOFF_THRESHOLD=0.60      (default)"
+echo "  HANDOFF_THRESHOLD=0.75      (default)"
 echo "  HANDOFF_CONTEXT_WINDOW=200000  (default, tokens)"

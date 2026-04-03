@@ -4,7 +4,7 @@ A [Claude Code](https://claude.ai/code) Stop hook that automatically asks Claude
 
 ## How it works
 
-The hook fires after every assistant turn. Once context usage crosses a configurable threshold (default: 60%), it:
+The hook fires after every assistant turn. Once context usage crosses a configurable threshold (default: 75%), it:
 
 1. Writes a `handoff-<YYYYMMDD-HHMM>.md` file in the current working directory — directly, without relying on Claude. The file contains the full conversation transcript (user messages, assistant responses, and tool calls).
 2. Injects a system message instructing Claude to fill in a structured Summary section (goal, progress, decisions, next steps, critical context) in the already-created file.
@@ -20,7 +20,7 @@ The hook fires **once per session** — it won't spam you on every subsequent tu
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/claude-handoff-hook.git
+git clone https://github.com/vanhaaggen/claude-handoff-hook.git
 cd claude-handoff-hook
 ./install.sh
 ```
@@ -33,10 +33,10 @@ Two environment variables control behavior. Set them inside the hook entry in `~
 
 | Variable | Default | Description |
 |---|---|---|
-| `HANDOFF_THRESHOLD` | `0.60` | Fraction of context window that triggers the handoff (0–1) |
+| `HANDOFF_THRESHOLD` | `0.75` | Fraction of context window that triggers the handoff (0–1) |
 | `HANDOFF_CONTEXT_WINDOW` | `200000` | Total context window size in tokens |
 
-Example — trigger at 75% for a 200k window:
+Example — trigger at 80% for a 200k window:
 
 ```json
 {
@@ -47,7 +47,7 @@ Example — trigger at 75% for a 200k window:
         "hooks": [
           {
             "type": "command",
-            "command": "HANDOFF_THRESHOLD=0.75 python3 /path/to/hook.py"
+            "command": "HANDOFF_THRESHOLD=0.80 python3 /path/to/hook.py"
           }
         ]
       }
@@ -80,11 +80,11 @@ If you prefer to add the hook by hand, open `~/.claude/settings.json` and add:
 
 ## Uninstallation
 
-Remove the hook entry from `~/.claude/settings.json`. You can also delete the state directory that tracks which sessions have already been triggered:
-
 ```bash
-rm -rf ~/.claude/handoff-hook-state
+./uninstall.sh
 ```
+
+This removes the hook entry from `~/.claude/settings.json` and optionally deletes the state directory (`~/.claude/handoff-hook-state`) that tracks which sessions have already triggered a handoff.
 
 ## How the token count is calculated
 

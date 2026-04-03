@@ -12,7 +12,7 @@ Token counting uses the exact usage data already present in the transcript
 No API calls, no external libraries needed.
 
 Configuration (env vars):
-  HANDOFF_THRESHOLD       Float 0-1, default 0.60  (60%)
+  HANDOFF_THRESHOLD       Float 0-1, default 0.75  (75%)
   HANDOFF_CONTEXT_WINDOW  Integer, default 200000
 """
 
@@ -24,7 +24,7 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-THRESHOLD = float(os.environ.get("HANDOFF_THRESHOLD", "0.60"))
+THRESHOLD = float(os.environ.get("HANDOFF_THRESHOLD", "0.75"))
 CONTEXT_WINDOW = int(os.environ.get("HANDOFF_CONTEXT_WINDOW", "200000"))
 
 # ── State dir (one file per session to fire only once) ───────────────────────
@@ -113,8 +113,16 @@ def content_to_text(content, role: str) -> str:
                 parts.append(f"[Tool: {name} → {inp['pattern']}]")
             else:
                 parts.append(f"[Tool: {name}]")
-        # tool_result blocks are skipped — they are verbose and already implied
-        # by the tool_use entries above
+        elif btype == "tool_result":
+            # Include a truncated snippet so the handoff summary has result context
+            result = block.get("content", "")
+            if isinstance(result, list):
+                result = " ".join(
+                    b.get("text", "") for b in result if isinstance(b, dict)
+                )
+            full = str(result).strip()
+            if full:
+                parts.append(f"[Result: {full[:200]}{'…' if len(full) > 200 else ''}]")
 
     return "\n".join(parts)
 
@@ -153,10 +161,11 @@ def extract_conversation(transcript_path: str) -> list:
 # ── Handoff file writer ───────────────────────────────────────────────────────
 
 def write_handoff_file(cwd: str, pct: float, tokens_used: int, turns: list) -> Path:
-    """Write the handoff markdown file and return its path."""
+    """Write the handoff markdown file atomically and return its path."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
     filename = f"handoff-{timestamp}.md"
     filepath = Path(cwd) / filename
+    tmp_path = filepath.with_suffix(".md.tmp")
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
@@ -203,18 +212,35 @@ def write_handoff_file(cwd: str, pct: float, tokens_used: int, turns: list) -> P
         lines.append("---")
         lines.append("")
 
-    filepath.write_text("\n".join(lines), encoding="utf-8")
+    tmp_path.write_text("\n".join(lines), encoding="utf-8")
+    tmp_path.rename(filepath)
     return filepath
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def prune_state_dir(max_age_days: int = 7) -> None:
+    """Remove state files older than max_age_days to prevent unbounded accumulation."""
+    if not STATE_DIR.exists():
+        return
+    cutoff = datetime.now().timestamp() - max_age_days * 86400
+    for entry in STATE_DIR.iterdir():
+        if entry.is_file() and entry.stat().st_mtime < cutoff:
+            entry.unlink(missing_ok=True)
+
+
 def main() -> None:
-    payload = json.loads(sys.stdin.read())
+    try:
+        payload = json.loads(sys.stdin.read())
+    except (json.JSONDecodeError, OSError):
+        sys.exit(0)
 
     session_id = payload.get("session_id", "unknown")
     transcript_path = payload.get("transcript_path", "")
-    cwd = payload.get("cwd") or os.getcwd()
+
+    # Use payload cwd; fall back to home dir (os.getcwd() is unreliable in hook subprocesses)
+    cwd = payload.get("cwd") or str(Path.home())
+    cwd_from_payload = bool(payload.get("cwd"))
 
     if not transcript_path or not Path(transcript_path).exists():
         sys.exit(0)
@@ -223,6 +249,8 @@ def main() -> None:
     sf = state_file(session_id)
     if sf.exists():
         sys.exit(0)
+
+    prune_state_dir()
 
     tokens_used = count_tokens_from_transcript(transcript_path)
     if tokens_used == 0:
@@ -233,17 +261,23 @@ def main() -> None:
     if pct < THRESHOLD:
         sys.exit(0)
 
-    # Mark triggered so this doesn't repeat
-    sf.write_text(f"{tokens_used}/{CONTEXT_WINDOW} = {pct:.1%}")
-
-    # Write the handoff file directly — don't rely on Claude to create it
+    # Write the handoff file first — mark triggered only on success
     turns = extract_conversation(transcript_path)
     handoff_path = write_handoff_file(cwd, pct, tokens_used, turns)
+
+    # Persist state so the hook doesn't fire again this session
+    sf.write_text(f"{tokens_used}/{CONTEXT_WINDOW} = {pct:.1%}")
+
+    location_note = (
+        ""
+        if cwd_from_payload
+        else f" (written to home directory {cwd} because project directory was unavailable)"
+    )
 
     message = (
         f"[HANDOFF HOOK] Context window is at {pct:.0%} "
         f"({tokens_used:,} / {CONTEXT_WINDOW:,} tokens). "
-        f"A handoff file has been created at `{handoff_path}`. "
+        f"A handoff file has been created at `{handoff_path}`{location_note}. "
         "Open that file and fill in the Summary section NOW — "
         "Goal, Progress, Key Decisions, Next Steps, and Critical Context. "
         "Do not do anything else first. "
