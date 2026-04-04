@@ -3,17 +3,25 @@
 Claude Code Context Handoff Hook
 
 Fires after every assistant turn (Stop hook).
-When context usage crosses THRESHOLD:
+When context usage crosses WARN_THRESHOLD (default 60%):
+  - Injects a lightweight heads-up message (once per session).
+When context usage crosses THRESHOLD (default 75%):
   1. Reads the transcript and writes handoff-<YYYYMMDD-HHMM>.md directly.
   2. Injects a system message asking Claude to fill in the Summary section.
 
-Token counting uses the exact usage data already present in the transcript
-(same formula as Claude Code internals: tokens.ts:getTokenCountFromUsage).
-No API calls, no external libraries needed.
+Performance: transcript is reverse-scanned to find the last assistant entry
+in O(1) for the common case — no full-file read on every turn.
+
+Context window size is auto-detected from the model name in the transcript,
+falling back to HANDOFF_CONTEXT_WINDOW when the model is unknown.
+
+State is guarded by atomic exclusive-create to prevent duplicate handoffs
+even if the hook fires concurrently (e.g. rapid Stop events).
 
 Configuration (env vars):
   HANDOFF_THRESHOLD       Float 0-1, default 0.75  (75%)
-  HANDOFF_CONTEXT_WINDOW  Integer, default 200000
+  HANDOFF_WARN_THRESHOLD  Float 0-1, default 0.60  (60%); set to 0 to disable
+  HANDOFF_CONTEXT_WINDOW  Integer, default 200000   (fallback when model unknown)
 """
 
 import json
@@ -22,68 +30,134 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+HOOK_VERSION = "2.0.0"
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 THRESHOLD = float(os.environ.get("HANDOFF_THRESHOLD", "0.75"))
+WARN_THRESHOLD = float(os.environ.get("HANDOFF_WARN_THRESHOLD", "0.60"))
 CONTEXT_WINDOW = int(os.environ.get("HANDOFF_CONTEXT_WINDOW", "200000"))
 
-# ── State dir (one file per session to fire only once) ───────────────────────
+# Clamp to valid ranges
+THRESHOLD = max(0.01, min(1.0, THRESHOLD))
+CONTEXT_WINDOW = max(1000, CONTEXT_WINDOW)
+WARN_THRESHOLD = max(0.0, min(THRESHOLD - 0.01, WARN_THRESHOLD))
+
+# ── Model → context window map ────────────────────────────────────────────────
+
+# Keyed by model-name prefix. Falls back to CONTEXT_WINDOW for unknown models.
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-opus-4":       200_000,
+    "claude-sonnet-4":     200_000,
+    "claude-haiku-4":      200_000,
+    "claude-3-7-sonnet":   200_000,
+    "claude-3-5-sonnet":   200_000,
+    "claude-3-5-haiku":    200_000,
+    "claude-3-opus":       200_000,
+    "claude-3-haiku":      200_000,
+    "claude-3-sonnet":     200_000,
+}
+
+
+def get_context_window(model: str) -> int:
+    """Return the context window for model, falling back to CONTEXT_WINDOW env var."""
+    if model:
+        for prefix, window in MODEL_CONTEXT_WINDOWS.items():
+            if model.startswith(prefix):
+                return window
+    return CONTEXT_WINDOW
+
+
+# ── State dir ─────────────────────────────────────────────────────────────────
 
 STATE_DIR = Path.home() / ".claude" / "handoff-hook-state"
 
 
-def state_file(session_id: str) -> Path:
+def ensure_state_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    return STATE_DIR / f"{session_id}.triggered"
 
 
-# ── Token counting ────────────────────────────────────────────────────────────
-
-def count_tokens_from_transcript(transcript_path: str) -> int:
+def acquire_once(path: Path) -> bool:
     """
-    Reads the JSONL transcript and returns the total context window tokens
-    from the last real assistant message.
+    Atomically create path with exclusive-create (O_EXCL).
+    Returns True if this call created the file (we own it),
+    False if it already existed (another invocation beat us).
     """
-    last_usage = None
+    try:
+        path.open("x").close()
+        return True
+    except FileExistsError:
+        return False
 
-    with open(transcript_path, "r", encoding="utf-8") as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                entry = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
 
-            if entry.get("type") != "assistant":
-                continue
+def prune_state_dir(max_age_days: int = 7) -> None:
+    """Remove state files older than max_age_days."""
+    if not STATE_DIR.exists():
+        return
+    cutoff = datetime.now().timestamp() - max_age_days * 86400
+    for entry in STATE_DIR.iterdir():
+        if entry.is_file() and entry.stat().st_mtime < cutoff:
+            entry.unlink(missing_ok=True)
 
-            usage = entry.get("message", {}).get("usage")
-            if not usage:
-                continue
 
-            # Skip synthetic messages (no real model)
-            model = entry.get("message", {}).get("model", "")
-            if model == "synthetic":
-                continue
+# ── Token counting — reverse scan ─────────────────────────────────────────────
 
-            last_usage = usage
+def find_last_assistant_usage(transcript_path: str) -> tuple[int, str]:
+    """
+    Reverse-scan the JSONL transcript to find the last non-synthetic assistant
+    entry with usage data. Returns (token_count, model_name).
 
-    if last_usage is None:
-        return 0
+    Reads from the end in 8 KB chunks, so for the common case (last entry is
+    the most recent turn) this is effectively O(1) regardless of file size.
+    """
+    CHUNK = 8192
+    with open(transcript_path, "rb") as fh:
+        fh.seek(0, 2)
+        pos = fh.tell()
+        remainder = b""
 
-    return (
-        last_usage.get("input_tokens", 0)
-        + last_usage.get("cache_creation_input_tokens", 0)
-        + last_usage.get("cache_read_input_tokens", 0)
-        + last_usage.get("output_tokens", 0)
-    )
+        while pos > 0:
+            step = min(CHUNK, pos)
+            pos -= step
+            fh.seek(pos)
+            block = fh.read(step) + remainder
+            lines = block.split(b"\n")
+
+            # lines[0] may be a partial line when not at the file start.
+            if pos > 0:
+                remainder = lines[0]
+                lines = lines[1:]
+
+            for raw in reversed(lines):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+                    continue
+                if entry.get("type") != "assistant":
+                    continue
+                msg = entry.get("message", {})
+                if msg.get("model") == "synthetic":
+                    continue
+                usage = msg.get("usage")
+                if not usage:
+                    continue
+                tokens = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                    + usage.get("output_tokens", 0)
+                )
+                return tokens, msg.get("model", "")
+
+    return 0, ""
 
 
 # ── Transcript extraction ─────────────────────────────────────────────────────
 
-def content_to_text(content, role: str) -> str:
+def content_to_text(content) -> str:
     """Convert a message content field (str or list of blocks) to plain text."""
     if isinstance(content, str):
         return content
@@ -150,7 +224,7 @@ def extract_conversation(transcript_path: str) -> list:
                 continue
 
             content = entry.get("message", {}).get("content", "")
-            text = content_to_text(content, entry_type)
+            text = content_to_text(content)
 
             if text.strip():
                 turns.append({"role": entry_type, "text": text})
@@ -160,7 +234,9 @@ def extract_conversation(transcript_path: str) -> list:
 
 # ── Handoff file writer ───────────────────────────────────────────────────────
 
-def write_handoff_file(cwd: str, pct: float, tokens_used: int, turns: list) -> Path:
+def write_handoff_file(
+    cwd: str, pct: float, tokens_used: int, effective_window: int, model: str, turns: list
+) -> Path:
     """Write the handoff markdown file atomically and return its path."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
     filename = f"handoff-{timestamp}.md"
@@ -168,10 +244,11 @@ def write_handoff_file(cwd: str, pct: float, tokens_used: int, turns: list) -> P
     tmp_path = filepath.with_suffix(".md.tmp")
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    model_note = f" · Model: {model}" if model else ""
     lines = [
         f"# Handoff — {now_str}",
         "",
-        f"> **Context:** {pct:.0%} used ({tokens_used:,} / {CONTEXT_WINDOW:,} tokens).",
+        f"> **Context:** {pct:.0%} used ({tokens_used:,} / {effective_window:,} tokens{model_note}).",
         "> This file was created automatically by the handoff hook.",
         "> Claude: please fill in the Summary section below before ending this session.",
         "",
@@ -219,16 +296,6 @@ def write_handoff_file(cwd: str, pct: float, tokens_used: int, turns: list) -> P
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def prune_state_dir(max_age_days: int = 7) -> None:
-    """Remove state files older than max_age_days to prevent unbounded accumulation."""
-    if not STATE_DIR.exists():
-        return
-    cutoff = datetime.now().timestamp() - max_age_days * 86400
-    for entry in STATE_DIR.iterdir():
-        if entry.is_file() and entry.stat().st_mtime < cutoff:
-            entry.unlink(missing_ok=True)
-
-
 def main() -> None:
     try:
         payload = json.loads(sys.stdin.read())
@@ -237,53 +304,89 @@ def main() -> None:
 
     session_id = payload.get("session_id", "unknown")
     transcript_path = payload.get("transcript_path", "")
-
-    # Use payload cwd; fall back to home dir (os.getcwd() is unreliable in hook subprocesses)
     cwd = payload.get("cwd") or str(Path.home())
     cwd_from_payload = bool(payload.get("cwd"))
 
     if not transcript_path or not Path(transcript_path).exists():
         sys.exit(0)
 
-    # Fire only once per session
-    sf = state_file(session_id)
-    if sf.exists():
+    # Fast exit: full handoff already done this session (most common path after trigger)
+    sf_triggered = STATE_DIR / f"{session_id}.triggered"
+    if sf_triggered.exists():
         sys.exit(0)
 
-    prune_state_dir()
-
-    tokens_used = count_tokens_from_transcript(transcript_path)
+    # Reverse-scan for token count and model — O(1) for the current turn
+    tokens_used, model = find_last_assistant_usage(transcript_path)
     if tokens_used == 0:
         sys.exit(0)
 
-    pct = tokens_used / CONTEXT_WINDOW
+    effective_window = get_context_window(model)
+    pct = tokens_used / effective_window
 
-    if pct < THRESHOLD:
+    # Fast exit: below even the lowest active threshold
+    lower_bound = WARN_THRESHOLD if WARN_THRESHOLD > 0 else THRESHOLD
+    if pct < lower_bound:
         sys.exit(0)
 
-    # Write the handoff file first — mark triggered only on success
-    turns = extract_conversation(transcript_path)
-    handoff_path = write_handoff_file(cwd, pct, tokens_used, turns)
+    # From here we need the state directory; also a good time to prune
+    ensure_state_dir()
+    prune_state_dir()
 
-    # Persist state so the hook doesn't fire again this session
-    sf.write_text(f"{tokens_used}/{CONTEXT_WINDOW} = {pct:.1%}")
+    if pct >= THRESHOLD:
+        # ── Full handoff ───────────────────────────────────────────────────────
+        # Atomic exclusive-create: prevents duplicate handoffs if the hook fires
+        # concurrently or the process was killed before state was written last time.
+        if not acquire_once(sf_triggered):
+            sys.exit(0)
 
-    location_note = (
-        ""
-        if cwd_from_payload
-        else f" (written to home directory {cwd} because project directory was unavailable)"
-    )
+        try:
+            turns = extract_conversation(transcript_path)
+            handoff_path = write_handoff_file(
+                cwd, pct, tokens_used, effective_window, model, turns
+            )
+        except Exception as e:
+            # Roll back the lock so the next turn can retry
+            sf_triggered.unlink(missing_ok=True)
+            print(f"[handoff-hook] Failed to write handoff: {e}", file=sys.stderr)
+            sys.exit(0)
 
-    message = (
-        f"[HANDOFF HOOK] Context window is at {pct:.0%} "
-        f"({tokens_used:,} / {CONTEXT_WINDOW:,} tokens). "
-        f"A handoff file has been created at `{handoff_path}`{location_note}. "
-        "Open that file and fill in the Summary section NOW — "
-        "Goal, Progress, Key Decisions, Next Steps, and Critical Context. "
-        "Do not do anything else first. "
-        "After filling in the Summary, tell the user the handoff is ready and suggest: "
-        f"'Start a new session and say: Read {handoff_path.name} and continue from there.'"
-    )
+        sf_triggered.write_text(
+            f"v{HOOK_VERSION} {tokens_used}/{effective_window} = {pct:.1%} model={model}"
+        )
+
+        location_note = (
+            ""
+            if cwd_from_payload
+            else f" (written to home directory {cwd} because project directory was unavailable)"
+        )
+
+        message = (
+            f"[HANDOFF HOOK] Context window is at {pct:.0%} "
+            f"({tokens_used:,} / {effective_window:,} tokens). "
+            f"A handoff file has been created at `{handoff_path}`{location_note}. "
+            "Open that file and fill in the Summary section NOW — "
+            "Goal, Progress, Key Decisions, Next Steps, and Critical Context. "
+            "Do not do anything else first. "
+            "After filling in the Summary, tell the user the handoff is ready and suggest: "
+            f"'Start a new session and say: Read {handoff_path.name} and continue from there.'"
+        )
+
+    else:
+        # ── Early warning (WARN_THRESHOLD <= pct < THRESHOLD) ─────────────────
+        sf_warned = STATE_DIR / f"{session_id}.warned"
+        if not acquire_once(sf_warned):
+            sys.exit(0)
+
+        sf_warned.write_text(
+            f"v{HOOK_VERSION} {tokens_used}/{effective_window} = {pct:.1%} model={model}"
+        )
+
+        message = (
+            f"[HANDOFF HOOK] Heads up: context is at {pct:.0%} "
+            f"({tokens_used:,} / {effective_window:,} tokens). "
+            f"A handoff document will be prepared automatically at {THRESHOLD:.0%}. "
+            "Consider wrapping up long-running tasks soon."
+        )
 
     print(json.dumps({"systemMessage": message}))
     sys.exit(0)
